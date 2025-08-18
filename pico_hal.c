@@ -19,22 +19,34 @@
 
 #include "pico_hal.h"
 
+#ifndef FS_SIZE
 #define FS_SIZE (256 * 1024)
+#endif
 
-static int pico_hal_read(lfs_block_t block, lfs_off_t off, void* buffer, lfs_size_t size);
-static int pico_hal_prog(lfs_block_t block, lfs_off_t off, const void* buffer, lfs_size_t size);
-static int pico_hal_erase(lfs_block_t block);
-static int pico_lock(void);
-static int pico_unlock(void);
+#ifndef UNUSED
+#define UNUSED(x) { (void)(x); }
+#endif
+
+static lfs_t pic_lfs_ctx;
+
+static int pico_hal_read(const struct lfs_config *cfg, lfs_block_t block, lfs_off_t off, void* buffer, lfs_size_t size);
+static int pico_hal_prog(const struct lfs_config *cfg, lfs_block_t block, lfs_off_t off, const void* buffer, lfs_size_t size);
+static int pico_hal_erase(const struct lfs_config *cfg, lfs_block_t block);
+static int pico_hal_sync(const struct lfs_config *cfg);
+#if LIB_PICO_MULTICORE
+static int pico_lock(const struct lfs_config *cfg);
+static int pico_unlock(const struct lfs_config *cfg);
+#endif
 
 // configuration of the filesystem is provided by this struct
 // for Pico: prog size = 256, block size = 4096, so cache is 8K
 // minimum cache = block size, must be multiple
-struct lfs_config pico_cfg = {
+static struct lfs_config pico_cfg = {
     // block device operations
     .read = pico_hal_read,
     .prog = pico_hal_prog,
     .erase = pico_hal_erase,
+    .sync = pico_hal_sync,
 #if LIB_PICO_MULTICORE
     .lock = pico_lock,
     .unlock = pico_unlock,
@@ -46,14 +58,16 @@ struct lfs_config pico_cfg = {
     .block_count = FS_SIZE / FLASH_SECTOR_SIZE,
     .cache_size = FLASH_SECTOR_SIZE / 4,
     .lookahead_size = 32,
-    .block_cycles = 500};
+    .block_cycles = 500,
+    .compact_thresh = -1};
 
 // Pico specific hardware abstraction functions
 
 // file system offset in flash
 const char* FS_BASE = (char*)(PICO_FLASH_SIZE_BYTES - FS_SIZE);
 
-static int pico_hal_read(lfs_block_t block, lfs_off_t off, void* buffer, lfs_size_t size) {
+static int pico_hal_read(const struct lfs_config *cfg, lfs_block_t block, lfs_off_t off, void* buffer, lfs_size_t size) {
+    UNUSED(cfg);
     assert(block < pico_cfg.block_count);
     assert(off + size <= pico_cfg.block_size);
     // read flash via XIP mapped space
@@ -61,7 +75,8 @@ static int pico_hal_read(lfs_block_t block, lfs_off_t off, void* buffer, lfs_siz
     return LFS_ERR_OK;
 }
 
-static int pico_hal_prog(lfs_block_t block, lfs_off_t off, const void* buffer, lfs_size_t size) {
+static int pico_hal_prog(const struct lfs_config *cfg, lfs_block_t block, lfs_off_t off, const void* buffer, lfs_size_t size) {
+    UNUSED(cfg);
     assert(block < pico_cfg.block_count);
     // program with SDK
     uint32_t p = (uint32_t)FS_BASE + (block * pico_cfg.block_size) + off;
@@ -71,7 +86,8 @@ static int pico_hal_prog(lfs_block_t block, lfs_off_t off, const void* buffer, l
     return LFS_ERR_OK;
 }
 
-static int pico_hal_erase(lfs_block_t block) {
+static int pico_hal_erase(const struct lfs_config *cfg, lfs_block_t block) {
+    UNUSED(cfg);
     assert(block < pico_cfg.block_count);
     // erase with SDK
     uint32_t p = (uint32_t)FS_BASE + block * pico_cfg.block_size;
@@ -81,16 +97,24 @@ static int pico_hal_erase(lfs_block_t block) {
     return LFS_ERR_OK;
 }
 
+static int pico_hal_sync(const struct lfs_config *cfg)
+{
+    UNUSED(cfg);
+    return LFS_ERR_OK;
+}
+
 #if LIB_PICO_MULTICORE
 
 static recursive_mutex_t fs_mtx;
 
-static int pico_lock(void) {
+static int pico_lock(const struct lfs_config *cfg) {
+    UNUSED(cfg);
     recursive_mutex_enter_blocking(&fs_mtx);
     return LFS_ERR_OK;
 }
 
-static int pico_unlock(void) {
+static int pico_unlock(const struct lfs_config *cfg) {
+    UNUSED(cfg);
     recursive_mutex_exit(&fs_mtx);
     return LFS_ERR_OK;
 }
@@ -111,16 +135,16 @@ int pico_mount(bool format) {
     recursive_mutex_init(&fs_mtx);
 #endif
     if (format)
-        lfs_format(&pico_cfg);
+        lfs_format(&pic_lfs_ctx, &pico_cfg);
     // mount the filesystem
-    return lfs_mount(&pico_cfg);
+    return lfs_mount(&pic_lfs_ctx, &pico_cfg);
 }
 
 int pico_open(const char* path, int flags) {
     lfs_file_t* file = lfs_malloc(sizeof(lfs_file_t));
     if (file == NULL)
         return LFS_ERR_NOMEM;
-    int err = lfs_file_open(file, path, flags);
+    int err = lfs_file_open(&pic_lfs_ctx, file, path, flags);
     if (err != LFS_ERR_OK){
         lfs_free(file);
         return err;
@@ -129,69 +153,69 @@ int pico_open(const char* path, int flags) {
 }
 
 int pico_close(int file) {
-    int res = lfs_file_close((lfs_file_t*)file);
+    int res = lfs_file_close(&pic_lfs_ctx, (lfs_file_t*)file);
     lfs_free((lfs_file_t*)file);
     return res;
 }
 
 lfs_size_t pico_write(int file, const void* buffer, lfs_size_t size) {
-    return lfs_file_write((lfs_file_t*)file, buffer, size);
+    return lfs_file_write(&pic_lfs_ctx, (lfs_file_t*)file, buffer, size);
 }
 
 lfs_size_t pico_read(int file, void* buffer, lfs_size_t size) {
-    return lfs_file_read((lfs_file_t*)file, buffer, size);
+    return lfs_file_read(&pic_lfs_ctx, (lfs_file_t*)file, buffer, size);
 }
 
-int pico_rewind(int file) { return lfs_file_rewind((lfs_file_t*)file); }
+int pico_rewind(int file) { return lfs_file_rewind(&pic_lfs_ctx, (lfs_file_t*)file); }
 
-int pico_unmount(void) { return lfs_unmount(); }
+int pico_unmount(void) { return lfs_unmount(&pic_lfs_ctx); }
 
-int pico_remove(const char* path) { return lfs_remove(path); }
+int pico_remove(const char* path) { return lfs_remove(&pic_lfs_ctx, path); }
 
-int pico_rename(const char* oldpath, const char* newpath) { return lfs_rename(oldpath, newpath); }
+int pico_rename(const char* oldpath, const char* newpath) { return lfs_rename(&pic_lfs_ctx, oldpath, newpath); }
 
 int pico_fsstat(struct pico_fsstat_t* stat) {
     stat->block_count = pico_cfg.block_count;
     stat->block_size = pico_cfg.block_size;
-    stat->blocks_used = lfs_fs_size();
+    stat->blocks_used = lfs_fs_size(&pic_lfs_ctx);
     return LFS_ERR_OK;
 }
 
 lfs_soff_t pico_lseek(int file, lfs_soff_t off, int whence) {
-    return lfs_file_seek((lfs_file_t*)file, off, whence);
+    return lfs_file_seek(&pic_lfs_ctx, (lfs_file_t*)file, off, whence);
 }
 
-int pico_truncate(int file, lfs_off_t size) { return lfs_file_truncate((lfs_file_t*)file, size); }
+int pico_truncate(int file, lfs_off_t size) { return lfs_file_truncate(&pic_lfs_ctx, (lfs_file_t*)file, size); }
 
-lfs_soff_t pico_tell(int file) { return lfs_file_tell((lfs_file_t*)file); }
+lfs_soff_t pico_tell(int file) { return lfs_file_tell(&pic_lfs_ctx, (lfs_file_t*)file); }
 
-int pico_stat(const char* path, struct lfs_info* info) { return lfs_stat(path, info); }
+int pico_stat(const char* path, struct lfs_info* info) { return lfs_stat(&pic_lfs_ctx, path, info); }
 
 lfs_ssize_t pico_getattr(const char* path, uint8_t type, void* buffer, lfs_size_t size) {
-    return lfs_getattr(path, type, buffer, size);
+    return lfs_getattr(&pic_lfs_ctx, path, type, buffer, size);
 }
 
 int pico_setattr(const char* path, uint8_t type, const void* buffer, lfs_size_t size) {
-    return lfs_setattr(path, type, buffer, size);
+    return lfs_setattr(&pic_lfs_ctx, path, type, buffer, size);
 }
 
-int pico_removeattr(const char* path, uint8_t type) { return lfs_removeattr(path, type); }
+int pico_removeattr(const char* path, uint8_t type) { return lfs_removeattr(&pic_lfs_ctx, path, type); }
 
 int pico_opencfg(int file, const char* path, int flags, const struct lfs_file_config* config) {
-    return lfs_file_opencfg((lfs_file_t*)file, path, flags, config);
+    return lfs_file_opencfg(&pic_lfs_ctx, (lfs_file_t*)file, path, flags, config);
 }
 
-int pico_fflush(int file) { return lfs_file_sync((lfs_file_t*)file); }
+int pico_fflush(int file) { return lfs_file_sync(&pic_lfs_ctx, (lfs_file_t*)file); }
 
-lfs_soff_t pico_size(int file) { return lfs_file_size((lfs_file_t*)file); }
+lfs_soff_t pico_size(int file) { return lfs_file_size(&pic_lfs_ctx, (lfs_file_t*)file); }
 
-int pico_mkdir(const char* path) { return lfs_mkdir(path); }
+int pico_mkdir(const char* path) { return lfs_mkdir(&pic_lfs_ctx, path); }
 
 int pico_dir_open(const char* path) {
 	lfs_dir_t* dir = lfs_malloc(sizeof(lfs_dir_t));
 	if (dir == NULL)
 		return -1;
-	if (lfs_dir_open(dir, path) != LFS_ERR_OK) {
+	if (lfs_dir_open(&pic_lfs_ctx, dir, path) != LFS_ERR_OK) {
 		lfs_free(dir);
 		return -1;
 	}
@@ -199,17 +223,17 @@ int pico_dir_open(const char* path) {
 }
 
 int pico_dir_close(int dir) {
-	return lfs_dir_close((lfs_dir_t*)dir);
+	return lfs_dir_close(&pic_lfs_ctx, (lfs_dir_t*)dir);
 	lfs_free((void*)dir);
 }
 
-int pico_dir_read(int dir, struct lfs_info* info) { return lfs_dir_read((lfs_dir_t*)dir, info); }
+int pico_dir_read(int dir, struct lfs_info* info) { return lfs_dir_read(&pic_lfs_ctx, (lfs_dir_t*)dir, info); }
 
-int pico_dir_seek(int dir, lfs_off_t off) { return lfs_dir_seek((lfs_dir_t*)dir, off); }
+int pico_dir_seek(int dir, lfs_off_t off) { return lfs_dir_seek(&pic_lfs_ctx, (lfs_dir_t*)dir, off); }
 
-lfs_soff_t pico_dir_tell(int dir) { return lfs_dir_tell((lfs_dir_t*)dir); }
+lfs_soff_t pico_dir_tell(int dir) { return lfs_dir_tell(&pic_lfs_ctx, (lfs_dir_t*)dir); }
 
-int pico_dir_rewind(int dir) { return lfs_dir_rewind((lfs_dir_t*)dir); }
+int pico_dir_rewind(int dir) { return lfs_dir_rewind(&pic_lfs_ctx, (lfs_dir_t*)dir); }
 
 const char* pico_errmsg(int err) {
     static const struct {
@@ -231,7 +255,7 @@ const char* pico_errmsg(int err) {
                  {LFS_ERR_NOATTR, "No data/attr available"},
                  {LFS_ERR_NAMETOOLONG, "File name too long"}};
 
-    for (int i = 0; i < sizeof(mesgs) / sizeof(mesgs[0]); i++)
+    for (unsigned int i = 0; i < sizeof(mesgs) / sizeof(mesgs[0]); i++)
         if (err == mesgs[i].err)
             return mesgs[i].text;
     return "Unknown error";
