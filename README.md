@@ -1,4 +1,10 @@
 # pico-littlefs
+
+***
+__Fork__ of [littlefs-lib](https://github.com/lurk101/littlefs-lib).  
+The original project is archived and not supported. The goal of this fork is to keep the project up to date and synched with the latest version of [little-fs ARM project](https://github.com/littlefs-project/littlefs.git).
+***
+
 To be included as project submodule.
 
 A small C/C++ Posix like journaling file system for the Raspberry Pico using a size configurable
